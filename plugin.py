@@ -499,6 +499,9 @@ class MaiShangHaoHandler(BaseEventHandler):
         try:
             from src.chat.heart_flow.heartflow import heartflow
             from src.chat.heart_flow.heartFC_chat import HeartFChatting
+            from src.chat.message_receive.chat_stream import get_chat_manager
+            from src.chat.message_receive.message import MessageRecv
+            from maim_message import UserInfo, GroupInfo, BaseMessageInfo, Seg
             
             for group_info in groups_info:
                 stream_id = group_info["stream_id"]
@@ -511,6 +514,45 @@ class MaiShangHaoHandler(BaseEventHandler):
                 logger.info(f"[麦上号] 为群 {group_id} 触发 planner...")
                 
                 try:
+                    chat_manager = get_chat_manager()
+                    chat_stream = chat_manager.get_stream(stream_id)
+                    
+                    if chat_stream and chat_stream.context is None:
+                        sender_id = latest_msg.get("sender_id", "")
+                        sender_name = latest_msg.get("sender_name", "")
+                        content = latest_msg.get("content", "")
+                        msg_time = latest_msg.get("time", time.time())
+                        
+                        user_info = UserInfo(
+                            platform="qq",
+                            user_id=sender_id,
+                            user_nickname=sender_name,
+                            user_cardname="",
+                        )
+                        
+                        message_dict = {
+                            "message_info": {
+                                "platform": "qq",
+                                "message_id": latest_msg.get("message_id", f"offline_{msg_time}"),
+                                "time": msg_time,
+                                "group_info": {
+                                    "platform": "qq",
+                                    "group_id": group_id,
+                                    "group_name": "",
+                                },
+                                "user_info": user_info.to_dict(),
+                            },
+                            "message_segment": {
+                                "type": "text",
+                                "data": {"text": content},
+                            },
+                            "processed_plain_text": content,
+                        }
+                        
+                        fake_message = MessageRecv(message_dict)
+                        chat_stream.set_context(fake_message)
+                        logger.debug(f"[麦上号] 已为群 {group_id} 设置消息上下文")
+                    
                     chat_instance = await heartflow.get_or_create_heartflow_chat(stream_id)
                     
                     if chat_instance and isinstance(chat_instance, HeartFChatting):
