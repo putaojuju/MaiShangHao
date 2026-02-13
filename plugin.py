@@ -131,6 +131,14 @@ class MaiShangHaoHandler(BaseEventHandler):
             logger.info("[麦上号] 未配置需要同步的群，跳过同步")
             return True, True, "未配置同步群", None, None
 
+        valid_groups = [g for g in sync_groups if g and str(g).strip()]
+        if not valid_groups:
+            logger.info("[麦上号] 配置的群号均为空，跳过同步")
+            return True, True, "群号配置为空", None, None
+        
+        if len(valid_groups) != len(sync_groups):
+            logger.warning(f"[麦上号] 过滤了 {len(sync_groups) - len(valid_groups)} 个空群号")
+
         if not bot_qq:
             bot_qq = str(global_config.bot.qq_account)
 
@@ -144,12 +152,13 @@ class MaiShangHaoHandler(BaseEventHandler):
             total_skipped = 0
             synced_groups_info: List[Dict[str, Any]] = []
 
-            for group_id in sync_groups:
-                logger.info(f"[麦上号] 正在同步群 {group_id} 的消息...")
+            for group_id in valid_groups:
+                group_id_str = str(group_id).strip()
+                logger.info(f"[麦上号] 正在同步群 {group_id_str} 的消息...")
                 
                 synced, skipped, latest_msg = await self._sync_group_messages(
                     api=api,
-                    group_id=str(group_id),
+                    group_id=group_id_str,
                     message_count=message_count,
                     bot_qq=bot_qq,
                     dedupe_mode=dedupe_mode,
@@ -219,12 +228,14 @@ class MaiShangHaoHandler(BaseEventHandler):
         
         existing_message_ids = await self._get_existing_message_ids(stream_id)
         existing_message_hashes = await self._get_existing_message_hashes(stream_id)
+        existing_message_times = await self._get_existing_message_times(stream_id)
 
         synced = 0
         skipped = 0
         latest_msg_info: Optional[Dict] = None
-        synced_messages: List[Dict] = []
-
+        
+        processed_messages: List[Dict] = []
+        
         for msg in messages:
             try:
                 msg_id = str(msg.get("message_id", ""))
@@ -241,83 +252,149 @@ class MaiShangHaoHandler(BaseEventHandler):
                 if not content or not content.strip():
                     continue
 
-                should_skip = False
+                is_duplicate = False
                 if dedupe_mode == "message_id" and msg_id and msg_id in existing_message_ids:
-                    should_skip = True
+                    is_duplicate = True
                 elif dedupe_mode == "content_hash":
                     content_hash = self._generate_content_hash(sender_id, msg_time, content)
                     if content_hash in existing_message_hashes:
-                        should_skip = True
+                        is_duplicate = True
 
-                if should_skip:
-                    skipped += 1
-                    continue
-
-                synced_messages.append({
+                processed_messages.append({
                     "msg_id": msg_id,
                     "msg_time": msg_time,
                     "sender_id": sender_id,
                     "sender_name": sender_name,
                     "sender_card": sender_card,
                     "content": content,
+                    "is_duplicate": is_duplicate,
                 })
                 
-                latest_msg_info = {
-                    "message_id": msg_id,
-                    "time": msg_time,
-                    "sender_id": sender_id,
-                    "sender_name": sender_name,
-                    "content": content,
-                }
+                if is_duplicate:
+                    skipped += 1
+                else:
+                    latest_msg_info = {
+                        "message_id": msg_id,
+                        "time": msg_time,
+                        "sender_id": sender_id,
+                        "sender_name": sender_name,
+                        "content": content,
+                    }
 
             except Exception as e:
                 logger.error(f"[麦上号] 处理消息失败: {e}")
                 skipped += 1
 
-        if synced_messages:
-            if add_markers and len(synced_messages) > 0:
-                first_msg = synced_messages[0]
-                last_msg = synced_messages[-1]
-                
-                success = await self._store_marker_message(
-                    stream_id=stream_id,
-                    group_id=group_id,
-                    msg_time=first_msg["msg_time"] - 0.1,
-                    marker_type="start",
-                )
-                if success:
-                    synced += 1
-                
-            for msg_data in synced_messages:
-                success = await self._store_message(
-                    stream_id=stream_id,
-                    group_id=group_id,
-                    msg_id=msg_data["msg_id"],
-                    msg_time=msg_data["msg_time"],
-                    sender_id=msg_data["sender_id"],
-                    sender_name=msg_data["sender_name"],
-                    sender_card=msg_data["sender_card"],
-                    content=msg_data["content"],
-                )
-                if success:
-                    synced += 1
-                else:
-                    skipped += 1
-            
-            if add_markers and len(synced_messages) > 0:
-                success = await self._store_marker_message(
-                    stream_id=stream_id,
-                    group_id=group_id,
-                    msg_time=last_msg["msg_time"] + 0.1,
-                    marker_type="end",
-                )
-                if success:
-                    synced += 1
+        if not processed_messages:
+            logger.info(f"[麦上号] 群 {group_id} 没有需要处理的消息")
+            return 0, 0, None
+
+        offline_segments = self._identify_offline_segments(
+            processed_messages, existing_message_times
+        )
+        
+        logger.info(f"[麦上号] 群 {group_id} 识别到 {len(offline_segments)} 个离线消息段落")
+
+        for segment in offline_segments:
+            segment_synced = await self._store_offline_segment(
+                stream_id=stream_id,
+                group_id=group_id,
+                segment_messages=segment,
+                add_markers=add_markers,
+            )
+            synced += segment_synced
 
         logger.info(
             f"[麦上号] 群 {group_id} 同步完成：新增 {synced} 条，跳过 {skipped} 条"
         )
         return synced, skipped, latest_msg_info
+
+    def _identify_offline_segments(
+        self, 
+        processed_messages: List[Dict], 
+        existing_times: Set[float]
+    ) -> List[List[Dict]]:
+        """识别离线消息段落
+        
+        离线消息段落是指：
+        1. 连续的新消息（非重复）
+        2. 被已知消息"夹在中间"或"在最前面"或"在最后面"
+        
+        Returns:
+            离线消息段落列表，每个段落是一个消息列表
+        """
+        segments: List[List[Dict]] = []
+        current_segment: List[Dict] = []
+        
+        sorted_messages = sorted(processed_messages, key=lambda x: x["msg_time"])
+        
+        for msg in sorted_messages:
+            if msg["is_duplicate"]:
+                if current_segment:
+                    segments.append(current_segment)
+                    current_segment = []
+            else:
+                current_segment.append(msg)
+        
+        if current_segment:
+            segments.append(current_segment)
+        
+        return segments
+
+    async def _store_offline_segment(
+        self,
+        stream_id: str,
+        group_id: str,
+        segment_messages: List[Dict],
+        add_markers: bool = True,
+    ) -> int:
+        """存储一个离线消息段落
+        
+        Returns:
+            成功存储的消息数（包含标记消息）
+        """
+        if not segment_messages:
+            return 0
+            
+        synced = 0
+        first_msg = segment_messages[0]
+        last_msg = segment_messages[-1]
+        
+        if add_markers:
+            success = await self._store_marker_message(
+                stream_id=stream_id,
+                group_id=group_id,
+                msg_time=first_msg["msg_time"] - 0.1,
+                marker_type="start",
+            )
+            if success:
+                synced += 1
+        
+        for msg_data in segment_messages:
+            success = await self._store_message(
+                stream_id=stream_id,
+                group_id=group_id,
+                msg_id=msg_data["msg_id"],
+                msg_time=msg_data["msg_time"],
+                sender_id=msg_data["sender_id"],
+                sender_name=msg_data["sender_name"],
+                sender_card=msg_data["sender_card"],
+                content=msg_data["content"],
+            )
+            if success:
+                synced += 1
+        
+        if add_markers:
+            success = await self._store_marker_message(
+                stream_id=stream_id,
+                group_id=group_id,
+                msg_time=last_msg["msg_time"] + 0.1,
+                marker_type="end",
+            )
+            if success:
+                synced += 1
+        
+        return synced
 
     async def _store_marker_message(
         self,
@@ -498,6 +575,21 @@ class MaiShangHaoHandler(BaseEventHandler):
             logger.error(f"[麦上号] 获取已存在消息哈希失败: {e}")
             return set()
 
+    async def _get_existing_message_times(self, stream_id: str) -> Set[float]:
+        """获取数据库中已存在的消息时间戳集合"""
+        try:
+            messages = await asyncio.to_thread(
+                lambda: list(
+                    Messages.select(Messages.time)
+                    .where(Messages.chat_id == stream_id)
+                    .execute()
+                )
+            )
+            return {msg.time for msg in messages if msg.time}
+        except Exception as e:
+            logger.error(f"[麦上号] 获取已存在消息时间戳失败: {e}")
+            return set()
+
     def _generate_stream_id(self, platform: str, group_id: str) -> str:
         """生成聊天流ID（与 MaiBot 核心逻辑一致）"""
         components = [platform, str(group_id)]
@@ -603,16 +695,55 @@ class MaiShangHaoHandler(BaseEventHandler):
             return False
 
     def _extract_text(self, msg: dict) -> str:
-        """从消息中提取文本内容"""
+        """从消息中提取文本内容
+        
+        NapCat 返回的消息结构可能有：
+        - message: 数组格式 [{type: "text", data: {text: "..."}}, ...]
+        - content: 字符串或数组（某些版本）
+        - raw_message: CQ码格式字符串
+        """
+        message = msg.get("message", [])
+        if isinstance(message, list) and message:
+            texts = []
+            for seg in message:
+                if isinstance(seg, dict):
+                    seg_type = seg.get("type", "")
+                    seg_data = seg.get("data", {})
+                    if seg_type == "text":
+                        texts.append(seg_data.get("text", ""))
+                    elif seg_type == "at":
+                        qq = seg_data.get("qq", "")
+                        texts.append(f"[AT:{qq}]")
+                    elif seg_type == "face":
+                        texts.append("[表情]")
+                    elif seg_type == "image":
+                        texts.append("[图片]")
+                    elif seg_type == "record":
+                        texts.append("[语音]")
+                    elif seg_type == "video":
+                        texts.append("[视频]")
+                    elif seg_type == "reply":
+                        texts.append("[回复]")
+                    else:
+                        texts.append(f"[{seg_type}]")
+            return "".join(texts)
+        
         content = msg.get("content", [])
-        if isinstance(content, str):
+        if isinstance(content, str) and content.strip():
             return content
         if isinstance(content, list):
             texts = []
             for seg in content:
                 if isinstance(seg, dict) and seg.get("type") == "text":
                     texts.append(seg.get("data", {}).get("text", ""))
-            return "".join(texts)
+            result = "".join(texts)
+            if result.strip():
+                return result
+        
+        raw_message = msg.get("raw_message", "")
+        if isinstance(raw_message, str) and raw_message.strip():
+            return raw_message
+        
         return ""
 
 
