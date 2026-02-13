@@ -70,5 +70,5 @@ Thumbs.db
 *.log
 logs/
 
-# Local config (keep example)
-config.local.toml
+# Local config (user's local configuration)
+config.toml

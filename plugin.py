@@ -102,7 +102,7 @@ class NapCatAPI:
 class MaiShangHaoHandler(BaseEventHandler):
     """麦上号事件处理器 - 启动时同步离线消息"""
 
-    event_type = EventType.ON_STARTUP
+    event_type = EventType.ON_START
     handler_name = "mai_shang_hao_handler"
     handler_description = "启动时同步离线消息并触发 planner"
 

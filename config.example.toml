@@ -1,30 +1,30 @@
-# 麦上号 (MaiShangHao) - 配置文件
+# 麦上号 (MaiShangHao) - 配置文件示例
 # 离线消息同步插件，让麦麦在启动时能够看到下线期间收到的消息
 # 配置版本: 1.0.0
+#
+# 首次使用：将此文件重命名为 config.toml 并修改配置
 
 [plugin]
 # 是否启用插件
-enabled = false
+enabled = true
 
 # 配置文件版本
 config_version = "1.0.0"
-
 
 [napcat]
 # NapCat HTTP API 地址
 # 默认端口是 3000，如果你修改过 NapCat 配置，请相应修改
 # 
 # 如何确认 HTTP API 是否开启：
-# 1. 打开 NapCat 配置目录（通常在 %APPDATA%\NapCat\config）
-# 2. 查看 onebot11_<QQ号>.json 文件
-# 3. 确认 http.enable 为 true，http.port 为对应端口
+# 1. 打开 NapCat WebUI（通常是 http://127.0.0.1:6099）
+# 2. 进入「机器人」→「网络配置」→「HTTP 服务」
+# 3. 查看端口号和 token
 http_url = "http://127.0.0.1:3000"
 
 # NapCat access_token
-# 如果你在 NapCat 中配置了 access_token，请填写在这里
-# 对应配置文件中的 http.secret 字段
+# 如果你在 NapCat 中配置了 token，请填写在这里
+# 没有设置就留空
 access_token = ""
-
 
 [sync]
 # 需要同步消息的群号列表
