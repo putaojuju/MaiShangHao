@@ -1,0 +1,67 @@
+# 麦上号 (MaiShangHao) - 配置文件
+# 离线消息同步插件，让小铃在启动时能够看到下线期间收到的消息
+# 配置版本: 1.0.0
+
+[plugin]
+# 是否启用插件
+enabled = false
+
+# 配置文件版本
+config_version = "1.0.0"
+
+
+[napcat]
+# NapCat HTTP API 地址
+# 默认端口是 3000，如果你修改过 NapCat 配置，请相应修改
+# 
+# 如何确认 HTTP API 是否开启：
+# 1. 打开 NapCat 配置目录（通常在 %APPDATA%\NapCat\config）
+# 2. 查看 onebot11_<QQ号>.json 文件
+# 3. 确认 http.enable 为 true，http.port 为对应端口
+http_url = "http://127.0.0.1:3000"
+
+# NapCat access_token
+# 如果你在 NapCat 中配置了 access_token，请填写在这里
+# 对应配置文件中的 http.secret 字段
+access_token = ""
+
+
+[sync]
+# 需要同步消息的群号列表
+# 填写你希望小铃在启动时"看到"离线消息的群号
+# 示例: [123456789, 987654321]
+groups = []
+
+# 每个群同步的消息数量
+# 建议不要设置太大，以免影响启动速度
+message_count = 50
+
+# 启动后延迟多少秒开始同步
+# 给 NapCat 一些时间完成连接和初始化
+delay_seconds = 5
+
+# 机器人QQ号
+# 用于过滤机器人自己发送的消息
+# 留空则会自动从配置中获取
+bot_qq = ""
+
+# 去重模式
+# - "message_id": 按消息ID去重（推荐，速度快）
+# - "content_hash": 按内容哈希去重（更精确，但速度稍慢）
+dedupe_mode = "message_id"
+
+# 同步完成后是否触发 planner 判断最新消息
+# 开启后，小铃会根据离线消息判断是否需要回复
+trigger_planner = true
+
+# 同步完成后延迟多少秒触发 planner
+# 给心流系统一些时间初始化
+planner_delay = 3
+
+# 是否在离线消息前后添加标记
+# 开启后，会在离线消息前后添加特殊标记，让 planner 和 replyer 知道这些是离线消息
+# 标记格式：
+#   【离线消息开始】以下是你下线期间收到的消息：
+#   ... 离线消息内容 ...
+#   【离线消息结束】以上是你下线期间收到的消息。
+add_markers = true
