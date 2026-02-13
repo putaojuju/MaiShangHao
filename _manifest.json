@@ -2,7 +2,7 @@
   "manifest_version": 1,
   "name": "麦上号 (MaiShangHao)",
   "version": "1.0.0",
-  "description": "离线消息同步插件，让小铃在启动时能够看到下线期间收到的消息，并自动触发回复判断",
+  "description": "离线消息同步插件，让麦麦在启动时能够看到下线期间收到的消息，并自动触发回复判断",
   "author": {
     "name": "putaojuju",
     "url": "https://github.com/putaojuju"
