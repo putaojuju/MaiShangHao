@@ -1,14 +1,20 @@
 # 麦上号 (MaiShangHao)
 
-麦麦离线消息同步插件，让麦麦在启动时能够"看到"下线期间收到的消息。
+麦麦离线消息同步 + AI做梦插件，让麦麦在启动时能够"看到"下线期间收到的消息，并在深夜生成荒诞梦境。
 
 ## 功能特性
 
-- 📥 **离线消息同步**：启动时自动拉取 NapCat 群历史消息
-- 🔄 **智能去重**：支持按消息ID或内容哈希去重，避免重复存储
-- 🏷️ **消息标记**：在离线消息前后添加特殊标记，让 planner 和 replyer 识别
-- 🤖 **自动触发**：同步完成后自动触发 planner 判断是否需要回复
-- ⚙️ **灵活配置**：支持配置同步群列表、消息数量、延迟时间等
+### 📥 离线消息同步
+- 启动时自动拉取 NapCat 群历史消息
+- 智能去重：支持按消息ID或内容哈希去重
+- 消息标记：在离线消息前后添加特殊标记
+- 自动触发：同步完成后自动触发 planner 判断是否需要回复
+
+### 💤 AI做梦功能
+- 在指定时间段（如凌晨3-4点）自动生成梦境
+- 梦境内容基于群聊历史，融入人物和话题
+- 以转发消息形式发送，避免刷屏
+- 与 planner 互斥，做梦期间不会触发回复
 
 ## 安装方法
 
@@ -36,7 +42,147 @@ message_count = 50  # 每个群同步的消息数量
 delay_seconds = 5  # 启动后延迟同步的秒数
 trigger_planner = true  # 是否触发 planner
 add_markers = true  # 是否添加离线消息标记
+
+[dream]
+enabled = true  # 启用做梦功能
+groups = [123456789]  # 做梦的群号列表
+times = ["03:00-04:00"]  # 做梦时间段
+dreams_per_day = 1  # 每个群每天做梦次数
+dream_interval_minutes = 60  # 多次做梦的最小间隔（分钟）
+check_interval = 60  # 检查间隔（秒）
+personality_traits = "此处填入你的bot人格"  # 梦境人格特质（必填！）
 ```
+
+---
+
+## 💤 做梦功能详解
+
+### 什么是 AI 做梦？
+
+AI 做梦是一个趣味功能，让麦麦在深夜"做梦"并分享梦境内容。梦境会：
+
+1. **基于群聊历史**：从最近的聊天中提取人物、话题、关键词
+2. **保持人格特质**：梦境内容符合麦麦的人格设定
+3. **荒诞有趣**：像真正的梦一样逻辑跳跃、超现实
+4. **转发消息发送**：以合并转发形式发送，不刷屏
+
+### 示例梦境
+
+```
+💤 鈴的梦境记录
+
+我梦见葡萄变成了代码，射命丸在用戳戳戳编译他。
+DP和NEO在天上飞，我追着问它们是什么...
+醒来后：还是没搞懂喵。
+```
+
+### 与 Planner 的互斥机制
+
+做梦期间，插件会设置全局状态，Planner 会检测到并跳过回复判断，避免梦境生成与正常回复产生冲突。
+
+### 配置人格特质
+
+`personality_traits` 用于指导 AI 生成符合你 bot 人格的梦境内容。**这个配置非常重要**，如果留空或使用默认值，梦境可能不符合你 bot 的性格。
+
+#### 如何填写？
+
+1. **打开你的 `bot_config.toml`**（位于 `config/bot_config.toml`）
+
+2. **找到 `[personality]` 部分**，查看 `personality` 字段：
+   ```toml
+   [personality]
+   personality = "盐系、高冷、妈妈役、句尾加喵"
+   ```
+
+3. **提取关键人格特质**，用简洁的关键词描述：
+   - ✅ 推荐：`"盐系、高冷、妈妈役、句尾加喵"`
+   - ✅ 推荐：`"傲娇、毒舌、内心温柔、喜欢甜食"`
+   - ❌ 不推荐：复制整个 personality 配置（太长会影响梦境生成效果）
+
+4. **填写到插件配置**：
+   ```toml
+   [dream]
+   personality_traits = "盐系、高冷、妈妈役、句尾加喵"
+   ```
+
+#### 也可以通过群聊命令修改
+
+```
+/dream set personality_traits 盐系、高冷、妈妈役、句尾加喵
+```
+
+### 多次做梦配置
+
+通过配置可以实现每个群每天多次做梦：
+
+```toml
+[dream]
+dreams_per_day = 3  # 每个群每天做3次梦
+dream_interval_minutes = 30  # 两次做梦至少间隔30分钟
+```
+
+### 手动重置做梦计数
+
+如果需要手动重置做梦计数（例如测试时），可以通过代码调用：
+
+```python
+from plugins.MaiShangHao.plugin import DreamHandler
+
+# 获取实例
+handler = DreamHandler.get_instance()
+if handler:
+    # 重置指定群的做梦计数
+    handler.reset_dream_count("123456789")
+    
+    # 或重置所有群的做梦计数
+    handler.reset_dream_count()
+```
+
+---
+
+## 💻 群聊命令
+
+插件提供了梦境管理命令，可以在群聊中直接使用：
+
+### 命令列表
+
+| 命令 | 说明 | 示例 |
+|------|------|------|
+| `/dream help` | 显示帮助 | `/dream help` |
+| `/dream status` | 查看梦境状态 | `/dream status` |
+| `/dream config` | 查看所有配置 | `/dream config` |
+| `/dream config <项>` | 查看指定配置 | `/dream config groups` |
+| `/dream enable` | 启用梦境功能 | `/dream enable` |
+| `/dream disable` | 禁用梦境功能 | `/dream disable` |
+| `/dream set <项> <值>` | 修改配置 | `/dream set dreams_per_day 3` |
+| `/dream reset` | 重置所有群做梦计数 | `/dream reset` |
+| `/dream reset <群号>` | 重置指定群做梦计数 | `/dream reset 123456789` |
+| `/dream test` | 在当前群测试梦境 | `/dream test` |
+| `/dream test <群号>` | 在指定群测试梦境 | `/dream test 123456789` |
+
+### 配置项说明
+
+| 配置项 | 类型 | 说明 |
+|--------|------|------|
+| `enabled` | bool | 是否启用梦境功能 |
+| `groups` | list | 做梦的群号列表 |
+| `times` | list | 做梦时间段 |
+| `dreams_per_day` | int | 每天做梦次数 |
+| `dream_interval_minutes` | int | 多次做梦间隔（分钟） |
+| `check_interval` | int | 检查间隔（秒） |
+| `personality_traits` | str | 梦境人格特质 |
+
+### 权限控制
+
+通过配置 `admin_users` 限制谁能使用梦境管理命令：
+
+```toml
+[dream]
+admin_users = ["123456789", "987654321"]  # 只有这些用户可以使用命令
+# admin_users = []  # 留空则没人可用（必须配置才能使用命令）
+```
+
+> ⚠️ **重要**：`admin_users` 为空时，梦境管理命令将无法使用。请务必配置至少一个管理员 QQ 号。
 
 ---
 

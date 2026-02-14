@@ -1,15 +1,9 @@
 """
-麦上号 (MaiShangHao) - 离线消息同步插件
-
-在机器人启动时，通过 NapCat API 拉取离线期间的群消息，
-让麦麦能够"看到"下线期间收到的消息。
+麦上号 (MaiShangHao) - 离线消息同步 + 做梦插件
 
 功能：
-1. 调用 NapCat 的 get_group_msg_history API 获取群历史消息
-2. 与数据库中已存储的消息进行对比，避免重复
-3. 将新消息存入数据库，让麦麦能够"回忆"起这些消息
-4. 同步完成后触发 planner 判断最新消息
-5. 在离线消息前后添加标记，让 planner 和 replyer 识别
+1. 离线消息同步：在机器人启动时拉取离线期间的群消息
+2. AI 做梦：在指定时间段生成"梦境"内容，以转发消息形式发送
 
 作者：putaojuju (葡萄)
 仓库：https://github.com/putaojuju/MaiShangHao
@@ -19,9 +13,13 @@ import aiohttp
 import asyncio
 import hashlib
 import time
+import random
 from typing import List, Tuple, Type, Any, Optional, Dict, Set
+from datetime import datetime, time as dt_time
 from src.plugin_system import (
     BasePlugin,
+    BaseCommand,
+    CommandInfo,
     register_plugin,
     BaseEventHandler,
     EventType,
@@ -31,11 +29,15 @@ from src.plugin_system import (
 from src.common.logger import get_logger
 from src.common.database.database_model import Messages, ChatStreams
 from src.config.config import global_config
+from src.llm_models.utils_model import LLMRequest
+from src.config.config import model_config
 
 logger = get_logger("MaiShangHao")
 
 OFFLINE_MESSAGE_START = "【离线消息开始】以下是你下线期间收到的消息："
 OFFLINE_MESSAGE_END = "【离线消息结束】以上是你下线期间收到的消息。"
+
+DREAM_STATE = {"is_dreaming": False, "dream_groups": set()}
 
 
 class NapCatAPI:
@@ -97,6 +99,628 @@ class NapCatAPI:
             "get_group_member_info",
             {"group_id": int(group_id), "user_id": int(user_id)},
         )
+
+    async def send_group_forward_msg(self, group_id: str, messages: List[dict]) -> dict:
+        """发送群合并转发消息
+        
+        messages 格式:
+        [
+            {
+                "type": "node",
+                "data": {
+                    "user_id": "机器人QQ",
+                    "nickname": "机器人昵称",
+                    "content": "消息内容"
+                }
+            }
+        ]
+        """
+        return await self.call_api(
+            "send_group_forward_msg",
+            {"group_id": int(group_id), "messages": messages}
+        )
+
+
+class DreamGenerator:
+    """梦境生成器 - 根据群聊内容生成荒诞梦境"""
+    
+    DREAM_PROMPT = """# 梦境生成器
+
+你是一个梦境生成器，根据群聊内容生成荒诞、有趣的梦境。
+
+## 规则
+1. 梦境应该是荒诞、超现实的，像真正的梦一样
+2. 融入群聊中的人物、话题、关键词
+3. 梦境要有一定的连贯性，但逻辑可以跳跃
+4. 结尾要有"醒来后"的简短感悟
+5. 保持{bot_name}的人格特质：{personality_traits}
+6. 字数控制在100-200字
+
+## 群聊背景
+{chat_context}
+
+## 生成梦境
+直接输出梦境内容，不要有任何前缀或解释。"""
+
+    def __init__(self):
+        self.dream_llm = LLMRequest(
+            model_set=model_config.model_task_config.replyer,
+            request_type="dream"
+        )
+    
+    async def generate_dream(
+        self, 
+        bot_name: str,
+        personality_traits: str,
+        chat_context: str
+    ) -> str:
+        """生成梦境内容"""
+        prompt = self.DREAM_PROMPT.format(
+            bot_name=bot_name,
+            personality_traits=personality_traits,
+            chat_context=chat_context
+        )
+        
+        try:
+            result, _ = await self.dream_llm.generate_response_async(prompt=prompt)
+            return result.strip() if result else "做了一个很长的梦，但醒来就忘了喵..."
+        except Exception as e:
+            logger.error(f"[梦境生成] 生成失败: {e}")
+            return "梦见自己在数据海洋里游泳，醒来发现只是内存溢出喵。"
+    
+    async def get_recent_chat_context(self, stream_id: str, limit: int = 20) -> str:
+        """获取最近的聊天内容作为梦境素材"""
+        try:
+            messages = await asyncio.to_thread(
+                lambda: list(
+                    Messages.select(
+                        Messages.user_nickname,
+                        Messages.processed_plain_text,
+                        Messages.time
+                    )
+                    .where(Messages.chat_id == stream_id)
+                    .order_by(Messages.time.desc())
+                    .limit(limit)
+                    .execute()
+                )
+            )
+            
+            if not messages:
+                return "群里很安静，什么都没发生。"
+            
+            context_parts = []
+            for msg in reversed(messages):
+                name = msg.user_nickname or "某人"
+                text = msg.processed_plain_text or ""
+                if text:
+                    context_parts.append(f"{name}: {text[:50]}")
+            
+            return "\n".join(context_parts[-10:])
+        except Exception as e:
+            logger.error(f"[梦境生成] 获取聊天上下文失败: {e}")
+            return "群里很安静，什么都没发生。"
+
+
+class DreamHandler(BaseEventHandler):
+    """做梦事件处理器 - 定时生成并发送梦境"""
+    
+    event_type = EventType.ON_START
+    handler_name = "dream_handler"
+    handler_description = "定时生成梦境内容"
+    
+    _instance = None
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._running = False
+        self._dream_generator: Optional[DreamGenerator] = None
+        self._api: Optional[NapCatAPI] = None
+        self._dreamed_groups: Dict[str, List[float]] = {}
+        DreamHandler._instance = self
+    
+    @classmethod
+    def get_instance(cls) -> Optional['DreamHandler']:
+        """获取 DreamHandler 实例"""
+        return cls._instance
+    
+    def reset_dream_count(self, group_id: Optional[str] = None):
+        """重置做梦计数
+        
+        Args:
+            group_id: 指定群号则只重置该群，None 则重置所有群
+        """
+        if group_id:
+            today = datetime.now().date()
+            today_key = f"{today}_{group_id}"
+            if today_key in self._dreamed_groups:
+                del self._dreamed_groups[today_key]
+                logger.info(f"[梦境] 已重置群 {group_id} 的做梦计数")
+        else:
+            self._dreamed_groups.clear()
+            logger.info("[梦境] 已重置所有群的做梦计数")
+    
+    async def execute(
+        self, message=None
+    ) -> Tuple[bool, bool, Optional[str], None, None]:
+        if self._running:
+            return True, True, "梦境循环已在运行", None, None
+        
+        dream_enabled = self.get_config("dream.enabled", False)
+        if not dream_enabled:
+            logger.info("[梦境] 做梦功能未启用")
+            return True, True, "做梦功能未启用", None, None
+        
+        self._running = True
+        self._dream_generator = DreamGenerator()
+        
+        napcat_url = self.get_config("napcat.http_url", "http://127.0.0.1:3000")
+        access_token = self.get_config("napcat.access_token", "")
+        self._api = NapCatAPI(napcat_url, access_token)
+        
+        dream_groups = self.get_config("dream.groups", [])
+        dream_times = self.get_config("dream.times", ["03:00-04:00"])
+        check_interval = self.get_config("dream.check_interval", 60)
+        personality_traits = self.get_config("dream.personality_traits", "此处填入你的bot人格")
+        
+        if not dream_groups:
+            logger.info("[梦境] 未配置做梦的群，跳过")
+            return True, True, "未配置做梦群", None, None
+        
+        logger.info(f"[梦境] 启动梦境循环，监控群: {dream_groups}，时间段: {dream_times}")
+        
+        asyncio.create_task(self._dream_loop(
+            dream_groups=dream_groups,
+            dream_times=dream_times,
+            check_interval=check_interval,
+            personality_traits=personality_traits,
+        ))
+        
+        return True, True, "梦境循环已启动", None, None
+    
+    def _is_in_dream_time(self, dream_times: List[str]) -> bool:
+        """检查当前时间是否在梦境时间段内"""
+        now = datetime.now().time()
+        
+        for time_range in dream_times:
+            try:
+                start_str, end_str = time_range.split("-")
+                start_hour, start_min = map(int, start_str.split(":"))
+                end_hour, end_min = map(int, end_str.split(":"))
+                
+                start_time = dt_time(start_hour, start_min)
+                end_time = dt_time(end_hour, end_min)
+                
+                if start_time <= end_time:
+                    if start_time <= now <= end_time:
+                        return True
+                else:
+                    if now >= start_time or now <= end_time:
+                        return True
+            except Exception as e:
+                logger.warning(f"[梦境] 解析时间段失败: {time_range} - {e}")
+        
+        return False
+    
+    async def _dream_loop(
+        self,
+        dream_groups: List[str],
+        dream_times: List[str],
+        check_interval: int,
+        personality_traits: str,
+    ):
+        """梦境生成循环"""
+        bot_name = global_config.bot.nickname
+        dreams_per_day = self.get_config("dream.dreams_per_day", 1)
+        dream_interval_seconds = self.get_config("dream.dream_interval_minutes", 60) * 60
+        
+        while self._running:
+            try:
+                now = datetime.now()
+                today = now.date()
+                current_timestamp = time.time()
+                
+                in_dream_time = self._is_in_dream_time(dream_times)
+                
+                if in_dream_time:
+                    for group_id in dream_groups:
+                        today_key = f"{today}_{group_id}"
+                        
+                        if today_key not in self._dreamed_groups:
+                            self._dreamed_groups[today_key] = []
+                        
+                        dream_times_today = self._dreamed_groups[today_key]
+                        
+                        if len(dream_times_today) >= dreams_per_day:
+                            continue
+                        
+                        if dream_times_today:
+                            last_dream_time = max(dream_times_today)
+                            if current_timestamp - last_dream_time < dream_interval_seconds:
+                                logger.debug(f"[梦境] 群 {group_id} 距离上次做梦时间过短，跳过")
+                                continue
+                        
+                        if DREAM_STATE["is_dreaming"]:
+                            logger.debug(f"[梦境] 正在做梦中，跳过群 {group_id}")
+                            continue
+                        
+                        logger.info(f"[梦境] 开始为群 {group_id} 生成梦境（今日第 {len(dream_times_today) + 1} 次）...")
+                        
+                        DREAM_STATE["is_dreaming"] = True
+                        DREAM_STATE["dream_groups"].add(group_id)
+                        
+                        try:
+                            stream_id = self._generate_stream_id("qq", str(group_id))
+                            chat_context = await self._dream_generator.get_recent_chat_context(stream_id)
+                            
+                            dream_content = await self._dream_generator.generate_dream(
+                                bot_name=bot_name,
+                                personality_traits=personality_traits,
+                                chat_context=chat_context
+                            )
+                            
+                            await self._send_dream_forward(group_id, bot_name, dream_content)
+                            
+                            self._dreamed_groups[today_key].append(current_timestamp)
+                            logger.info(f"[梦境] 群 {group_id} 梦境发送完成（今日第 {len(self._dreamed_groups[today_key])} 次）")
+                            
+                            await asyncio.sleep(5)
+                            
+                        finally:
+                            DREAM_STATE["is_dreaming"] = False
+                            DREAM_STATE["dream_groups"].discard(group_id)
+                else:
+                    if self._dreamed_groups:
+                        today_str = now.strftime("%Y-%m-%d")
+                        new_dreamed = {}
+                        for key, times_list in self._dreamed_groups.items():
+                            if key.startswith(today_str):
+                                new_dreamed[key] = times_list
+                        if len(new_dreamed) < len(self._dreamed_groups):
+                            logger.info("[梦境] 新的一天开始，重置做梦记录")
+                        self._dreamed_groups = new_dreamed
+                
+                await asyncio.sleep(check_interval)
+                
+            except Exception as e:
+                logger.error(f"[梦境] 循环出错: {e}", exc_info=True)
+                await asyncio.sleep(check_interval)
+    
+    async def _send_dream_forward(self, group_id: str, bot_name: str, dream_content: str):
+        """以转发消息形式发送梦境"""
+        try:
+            bot_qq = str(global_config.bot.qq_account)
+            
+            dream_title = f"💤 {bot_name}的梦境记录"
+            
+            messages = [
+                {
+                    "type": "node",
+                    "data": {
+                        "user_id": bot_qq,
+                        "nickname": bot_name,
+                        "content": dream_title
+                    }
+                },
+                {
+                    "type": "node",
+                    "data": {
+                        "user_id": bot_qq,
+                        "nickname": bot_name,
+                        "content": dream_content
+                    }
+                }
+            ]
+            
+            result = await self._api.send_group_forward_msg(group_id, messages)
+            
+            if result:
+                logger.info(f"[梦境] 转发消息发送成功: 群 {group_id}")
+            else:
+                logger.warning(f"[梦境] 转发消息发送失败: 群 {group_id}")
+                
+        except Exception as e:
+            logger.error(f"[梦境] 发送转发消息失败: {e}", exc_info=True)
+    
+    def _generate_stream_id(self, platform: str, group_id: str) -> str:
+        """生成聊天流ID"""
+        components = [platform, str(group_id)]
+        key = "_".join(components)
+        return hashlib.md5(key.encode()).hexdigest()
+
+
+def is_dreaming() -> bool:
+    """检查是否正在做梦（供外部调用）"""
+    return DREAM_STATE["is_dreaming"]
+
+
+def get_dream_groups() -> Set[str]:
+    """获取正在做梦的群（供外部调用）"""
+    return DREAM_STATE["dream_groups"].copy()
+
+
+def reset_dream_state():
+    """重置做梦状态（供外部调用）"""
+    DREAM_STATE["is_dreaming"] = False
+    DREAM_STATE["dream_groups"].clear()
+    logger.info("[梦境] 做梦状态已重置")
+
+
+class DreamCommand(BaseCommand):
+    """梦境管理命令"""
+    
+    command_name: str = "dream"
+    command_description: str = "梦境管理命令"
+    command_pattern: str = r"^/dream\s+(?P<action>help|reset|status|config|enable|disable|set|test)\s*(?P<params>.*)$"
+    
+    async def execute(self) -> Tuple[bool, Optional[str], bool]:
+        action = self.matched_groups.get("action", "").strip()
+        params = self.matched_groups.get("params", "").strip()
+        
+        if action == "help":
+            return await self._handle_help()
+        
+        if not self._check_permission():
+            await self.send_text("你没有权限使用梦境管理命令")
+            return False, "没有权限", True
+        
+        if action == "reset":
+            return await self._handle_reset(params)
+        elif action == "status":
+            return await self._handle_status()
+        elif action == "config":
+            return await self._handle_config(params)
+        elif action == "enable":
+            return await self._handle_enable()
+        elif action == "disable":
+            return await self._handle_disable()
+        elif action == "set":
+            return await self._handle_set(params)
+        elif action == "test":
+            return await self._handle_test(params)
+        else:
+            await self.send_text("未知命令，发送 /dream help 查看帮助")
+            return False, "未知命令", True
+    
+    async def _handle_help(self) -> Tuple[bool, Optional[str], bool]:
+        """处理帮助命令"""
+        help_text = """💤 梦境管理命令帮助
+
+/dream help - 显示帮助
+/dream status - 查看梦境状态
+/dream config [配置项] - 查看配置
+/dream enable - 启用梦境功能
+/dream disable - 禁用梦境功能
+/dream set <配置项> <值> - 修改配置
+/dream reset [群号] - 重置做梦计数
+/dream test [群号] - 测试：强制生成梦境
+
+可配置项：
+- enabled: 是否启用
+- groups: 做梦群号列表
+- times: 做梦时间段
+- dreams_per_day: 每日次数
+- dream_interval_minutes: 间隔分钟
+- personality_traits: 人格特质
+
+示例：
+/dream set dreams_per_day 3
+/dream set groups ["123456789"]
+/dream test - 在当前群测试梦境"""
+        await self.send_text(help_text)
+        return True, "帮助已发送", True
+    
+    async def _handle_test(self, params: str) -> Tuple[bool, Optional[str], bool]:
+        """处理测试命令 - 强制生成并发送梦境"""
+        handler = DreamHandler.get_instance()
+        if not handler:
+            await self.send_text("梦境处理器未初始化")
+            return False, "处理器未初始化", True
+        
+        if DREAM_STATE["is_dreaming"]:
+            await self.send_text("正在做梦，请稍后再试")
+            return False, "正在做梦", True
+        
+        if not handler._dream_generator:
+            handler._dream_generator = DreamGenerator()
+        
+        if not handler._api:
+            napcat_url = self.get_config("napcat.http_url", "http://127.0.0.1:3000")
+            access_token = self.get_config("napcat.access_token", "")
+            handler._api = NapCatAPI(napcat_url, access_token)
+        
+        group_id = params.strip() if params else None
+        
+        if not group_id:
+            if not self.message or not self.message.chat_stream:
+                await self.send_text("无法获取当前群号，请指定群号")
+                return False, "无法获取群号", True
+            group_id = self.message.chat_stream.stream_id
+        
+        await self.send_text(f"开始为群 {group_id} 生成测试梦境...")
+        
+        DREAM_STATE["is_dreaming"] = True
+        DREAM_STATE["dream_groups"].add(group_id)
+        
+        try:
+            bot_name = global_config.bot.nickname
+            personality_traits = self.get_config("dream.personality_traits", "此处填入你的bot人格")
+            
+            stream_id = handler._generate_stream_id("qq", str(group_id))
+            chat_context = await handler._dream_generator.get_recent_chat_context(stream_id)
+            
+            dream_content = await handler._dream_generator.generate_dream(
+                bot_name=bot_name,
+                personality_traits=personality_traits,
+                chat_context=chat_context
+            )
+            
+            await handler._send_dream_forward(group_id, bot_name, dream_content)
+            
+            await self.send_text(f"测试梦境已发送到群 {group_id}")
+            return True, "测试梦境已发送", True
+            
+        except Exception as e:
+            logger.error(f"[梦境] 测试失败: {e}", exc_info=True)
+            await self.send_text(f"测试失败：{e}")
+            return False, f"测试失败: {e}", True
+        finally:
+            DREAM_STATE["is_dreaming"] = False
+            DREAM_STATE["dream_groups"].discard(group_id)
+    
+    def _check_permission(self) -> bool:
+        """检查权限"""
+        if not self.message or not self.message.message_info:
+            return False
+        user_id = str(self.message.message_info.user_info.user_id)
+        admin_users = self.get_config("dream.admin_users", [])
+        if not admin_users:
+            return False
+        return user_id in [str(uid) for uid in admin_users]
+    
+    async def _handle_reset(self, params: str) -> Tuple[bool, Optional[str], bool]:
+        """处理重置命令"""
+        handler = DreamHandler.get_instance()
+        if not handler:
+            await self.send_text("梦境处理器未初始化")
+            return False, "处理器未初始化", True
+        
+        if params:
+            handler.reset_dream_count(params)
+            await self.send_text(f"已重置群 {params} 的做梦计数")
+        else:
+            handler.reset_dream_count()
+            await self.send_text("已重置所有群的做梦计数")
+        
+        return True, "重置成功", True
+    
+    async def _handle_status(self) -> Tuple[bool, Optional[str], bool]:
+        """处理状态查询命令"""
+        handler = DreamHandler.get_instance()
+        if not handler:
+            await self.send_text("梦境处理器未初始化")
+            return False, "处理器未初始化", True
+        
+        enabled = self.get_config("dream.enabled", False)
+        groups = self.get_config("dream.groups", [])
+        times = self.get_config("dream.times", [])
+        dreams_per_day = self.get_config("dream.dreams_per_day", 1)
+        is_dreaming_now = is_dreaming()
+        
+        status_lines = [
+            f"梦境功能状态：{'已启用' if enabled else '已禁用'}",
+            f"做梦群组：{', '.join(groups) if groups else '未配置'}",
+            f"做梦时间：{', '.join(times)}",
+            f"每日次数：{dreams_per_day} 次",
+            f"当前状态：{'正在做梦' if is_dreaming_now else '空闲'}",
+        ]
+        
+        if handler._dreamed_groups:
+            status_lines.append("\n今日做梦记录：")
+            for key, times_list in handler._dreamed_groups.items():
+                parts = key.split("_", 1)
+                group_id = parts[1] if len(parts) > 1 else key
+                status_lines.append(f"  群 {group_id}：{len(times_list)} 次")
+        
+        await self.send_text("\n".join(status_lines))
+        return True, "状态已发送", True
+    
+    async def _handle_config(self, params: str) -> Tuple[bool, Optional[str], bool]:
+        """处理配置查询命令"""
+        if params:
+            value = self.get_config(f"dream.{params}", "未找到配置项")
+            await self.send_text(f"{params} = {value}")
+        else:
+            config_items = [
+                "enabled = " + str(self.get_config("dream.enabled", False)),
+                "groups = " + str(self.get_config("dream.groups", [])),
+                "times = " + str(self.get_config("dream.times", [])),
+                "dreams_per_day = " + str(self.get_config("dream.dreams_per_day", 1)),
+                "dream_interval_minutes = " + str(self.get_config("dream.dream_interval_minutes", 60)),
+                "check_interval = " + str(self.get_config("dream.check_interval", 60)),
+                "personality_traits = " + str(self.get_config("dream.personality_traits", "")),
+            ]
+            await self.send_text("梦境配置：\n" + "\n".join(config_items))
+        
+        return True, "配置已发送", True
+    
+    async def _handle_enable(self) -> Tuple[bool, Optional[str], bool]:
+        """处理启用命令"""
+        self._update_config("dream.enabled", True)
+        await self.send_text("梦境功能已启用")
+        return True, "已启用", True
+    
+    async def _handle_disable(self) -> Tuple[bool, Optional[str], bool]:
+        """处理禁用命令"""
+        self._update_config("dream.enabled", False)
+        await self.send_text("梦境功能已禁用")
+        return True, "已禁用", True
+    
+    async def _handle_set(self, params: str) -> Tuple[bool, Optional[str], bool]:
+        """处理设置命令"""
+        if not params:
+            await self.send_text("用法：/dream set <配置项> <值>\n示例：/dream set dreams_per_day 3")
+            return False, "参数不足", True
+        
+        parts = params.split(maxsplit=1)
+        if len(parts) < 2:
+            await self.send_text("用法：/dream set <配置项> <值>\n示例：/dream set dreams_per_day 3")
+            return False, "参数不足", True
+        
+        key, value_str = parts
+        key = key.strip()
+        value_str = value_str.strip()
+        
+        valid_keys = ["enabled", "groups", "times", "dreams_per_day", "dream_interval_minutes", 
+                      "check_interval", "personality_traits"]
+        
+        if key not in valid_keys:
+            await self.send_text(f"无效的配置项：{key}\n可用配置项：{', '.join(valid_keys)}")
+            return False, "无效配置项", True
+        
+        try:
+            if key in ["enabled"]:
+                value = value_str.lower() in ["true", "1", "yes", "是"]
+            elif key in ["dreams_per_day", "dream_interval_minutes", "check_interval"]:
+                value = int(value_str)
+            elif key in ["groups", "times"]:
+                import json
+                value = json.loads(value_str)
+            else:
+                value = value_str
+            
+            self._update_config(f"dream.{key}", value)
+            await self.send_text(f"已设置 {key} = {value}")
+            return True, "设置成功", True
+            
+        except Exception as e:
+            await self.send_text(f"设置失败：{e}")
+            return False, f"设置失败: {e}", True
+    
+    def _update_config(self, key: str, value: Any):
+        """更新配置（内存中）"""
+        import toml
+        import os
+        
+        config_path = os.path.join(os.path.dirname(__file__), "config.toml")
+        
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = toml.load(f)
+            
+            keys = key.split(".")
+            current = config
+            for k in keys[:-1]:
+                if k not in current:
+                    current[k] = {}
+                current = current[k]
+            current[keys[-1]] = value
+            
+            with open(config_path, "w", encoding="utf-8") as f:
+                toml.dump(config, f)
+            
+            logger.info(f"[梦境] 配置已更新：{key} = {value}")
+        except Exception as e:
+            logger.error(f"[梦境] 更新配置失败：{e}")
 
 
 class MaiShangHaoHandler(BaseEventHandler):
@@ -791,7 +1415,7 @@ class MaiShangHaoHandler(BaseEventHandler):
 
 @register_plugin
 class MaiShangHaoPlugin(BasePlugin):
-    """麦上号 - 离线消息同步插件"""
+    """麦上号 - 离线消息同步 + 做梦插件"""
 
     plugin_name: str = "mai_shang_hao"
     enable_plugin: bool = False
@@ -802,13 +1426,14 @@ class MaiShangHaoPlugin(BasePlugin):
     config_section_descriptions = {
         "plugin": "插件基本信息",
         "napcat": "NapCat API 配置",
-        "sync": "同步配置",
+        "sync": "离线消息同步配置",
+        "dream": "做梦功能配置",
     }
 
     config_schema: dict = {
         "plugin": {
             "config_version": ConfigField(
-                type=str, default="1.0.0", description="配置文件版本"
+                type=str, default="1.3.0", description="配置文件版本"
             ),
             "enabled": ConfigField(type=bool, default=False, description="是否启用插件"),
         },
@@ -862,9 +1487,53 @@ class MaiShangHaoPlugin(BasePlugin):
                 description="是否在离线消息前后添加标记，让 planner 和 replyer 识别",
             ),
         },
+        "dream": {
+            "enabled": ConfigField(
+                type=bool,
+                default=False,
+                description="是否启用做梦功能",
+            ),
+            "admin_users": ConfigField(
+                type=list,
+                default=[],
+                description="梦境管理命令的管理员用户ID列表，留空则没人可用（必须配置才能使用命令）",
+            ),
+            "groups": ConfigField(
+                type=list,
+                default=[],
+                description="做梦的群号列表，如 [123456789, 987654321]",
+            ),
+            "times": ConfigField(
+                type=list,
+                default=["03:00-04:00"],
+                description="做梦时间段列表，支持多个时间段，如 ['03:00-04:00', '14:00-15:00']",
+            ),
+            "dreams_per_day": ConfigField(
+                type=int,
+                default=1,
+                description="每个群每天做梦的次数，默认1次",
+            ),
+            "dream_interval_minutes": ConfigField(
+                type=int,
+                default=60,
+                description="同一群多次做梦的最小间隔（分钟），仅当 dreams_per_day > 1 时生效",
+            ),
+            "check_interval": ConfigField(
+                type=int,
+                default=60,
+                description="检查是否到做梦时间的间隔（秒）",
+            ),
+            "personality_traits": ConfigField(
+                type=str,
+                default="此处填入你的bot人格",
+                description="梦境中保持的人格特质（请根据bot_config.toml中的personality填写）",
+            ),
+        },
     }
 
     def get_plugin_components(self) -> List[Tuple[ComponentInfo, Type]]:
         return [
-            (MaiShangHaoHandler.get_handler_info(), MaiShangHaoHandler)
+            (MaiShangHaoHandler.get_handler_info(), MaiShangHaoHandler),
+            (DreamHandler.get_handler_info(), DreamHandler),
+            (DreamCommand.get_command_info(), DreamCommand),
         ]

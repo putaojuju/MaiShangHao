@@ -72,3 +72,10 @@ logs/
 
 # Local config (user's local configuration)
 config.toml
+
+# Backup files
+*.backup.*
+
+# Debug files
+*.txt
+!README.txt
