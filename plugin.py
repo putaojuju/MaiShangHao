@@ -429,20 +429,8 @@ class DreamHandler(BaseEventHandler):
 
 
 def is_dreaming() -> bool:
-    """检查是否正在做梦（供外部调用）"""
+    """检查是否正在做梦"""
     return DREAM_STATE["is_dreaming"]
-
-
-def get_dream_groups() -> Set[str]:
-    """获取正在做梦的群（供外部调用）"""
-    return DREAM_STATE["dream_groups"].copy()
-
-
-def reset_dream_state():
-    """重置做梦状态（供外部调用）"""
-    DREAM_STATE["is_dreaming"] = False
-    DREAM_STATE["dream_groups"].clear()
-    logger.info("[梦境] 做梦状态已重置")
 
 
 class DreamCommand(BaseCommand):
