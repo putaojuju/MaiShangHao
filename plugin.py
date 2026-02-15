@@ -716,6 +716,34 @@ class DreamCommand(BaseCommand):
             logger.error(f"[梦境] 更新配置失败：{e}")
 
 
+class DreamMessageInterceptor(BaseEventHandler):
+    """梦境消息拦截器 - 做梦时拦截消息，阻止 planner 处理"""
+    
+    event_type = EventType.ON_MESSAGE_PRE_PROCESS
+    handler_name = "dream_message_interceptor"
+    handler_description = "做梦时拦截消息，阻止 planner 处理"
+    weight = 1000
+    intercept_message = True
+    
+    async def execute(
+        self, message
+    ) -> Tuple[bool, bool, Optional[str], None, None]:
+        if not is_dreaming():
+            return True, True, "不在做梦，放行", None, None
+        
+        if not message or not message.message_info:
+            return True, True, "无消息信息，放行", None, None
+        
+        group_id = message.chat_stream.stream_id
+        dream_groups = get_dream_groups()
+        
+        if group_id in dream_groups:
+            logger.info(f"[梦境拦截] 群 {group_id} 正在做梦，拦截消息")
+            return True, False, "做梦中，消息已拦截", None, None
+        
+        return True, True, "非做梦群，放行", None, None
+
+
 class MaiShangHaoHandler(BaseEventHandler):
     """麦上号事件处理器 - 启动时同步离线消息"""
 
@@ -1528,5 +1556,6 @@ class MaiShangHaoPlugin(BasePlugin):
         return [
             (MaiShangHaoHandler.get_handler_info(), MaiShangHaoHandler),
             (DreamHandler.get_handler_info(), DreamHandler),
+            (DreamMessageInterceptor.get_handler_info(), DreamMessageInterceptor),
             (DreamCommand.get_command_info(), DreamCommand),
         ]
