@@ -433,6 +433,11 @@ def is_dreaming() -> bool:
     return DREAM_STATE["is_dreaming"]
 
 
+def get_dream_groups() -> Set[str]:
+    """获取正在做梦的群（供外部调用）"""
+    return DREAM_STATE["dream_groups"].copy()
+
+
 class DreamCommand(BaseCommand):
     """梦境管理命令"""
     
